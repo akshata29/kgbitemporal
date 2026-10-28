@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Entity governance KG — Bitemporal Time Machine (demo)</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="title">
+    <h1>Entity governance knowledge graph <span>bitemporal time machine</span></h1>
+    <div class="sub">PostgreSQL 17 + Apache AGE graph · assertions versioned with <code>temporal_tables</code> + <code>btree_gist</code> · every hop access-filtered</div>
+  </div>
+  <div class="hdr-right">
+    <span class="badge synth">SYNTHETIC DATA · fictional entities &amp; rules</span>
+    <label>Viewing as
+      <select id="persona"></select>
+    </label>
+    <button id="reset" class="ghost" title="Drop and re-seed the demo database">Reset demo data</button>
+  </div>
+</header>
+
+<section id="controls">
+  <div class="ctl">
+    <div class="ctl-h"><b>Valid time</b> <i>"what was true in the real world on…"</i> <span id="validLabel" class="date"></span></div>
+    <input type="range" id="validSlider">
+  </div>
+  <div class="ctl">
+    <div class="ctl-h"><b>Known as of</b> <i>"what did the platform know on…"</i> <span id="knownLabel" class="date"></span></div>
+    <input type="range" id="knownSlider">
+  </div>
+  <div class="ctl presets">
+    <b>Scenarios</b>
+    <button data-preset="today">Today · latest knowledge</button>
+    <button data-preset="decision">Audit: decision of 2025-10-15, as known then</button>
+    <button data-preset="fabrikam-early">Fabrikam: 2024-09-01, known 2024-09-10</button>
+    <button data-preset="fabrikam-late">Fabrikam: 2024-09-01, known 2024-10-01</button>
+  </div>
+  <div class="ctl">
+    <div class="ctl-h"><b>Entity resolution</b> <i>"is 'Hank' the same person as 'Henrik'?"</i></div>
+    <label class="switch"><input type="radio" name="er" value="true" checked> Canonical entities (resolved)</label>
+    <label class="switch"><input type="radio" name="er" value="false"> Naive string match</label>
+  </div>
+</section>
+
+<nav id="tabs">
+  <button data-tab="query" class="on">1 · Corpus-wide query</button>
+  <button data-tab="graph">2 · Graph</button>
+  <button data-tab="time">3 · Bitemporal view</button>
+  <button data-tab="diff">4 · Then vs now (audit)</button>
+  <button data-tab="review">5 · Review &amp; correct</button>
+</nav>
+
+<main>
+  <section id="tab-query" class="tab on">
+    <div class="card">
+      <h2>Which entities have a <u>current director who also holds an ownership interest</u> — and does a rule in force require an independent director?</h2>
+      <p class="hint">One multi-hop traversal across the whole corpus:
+        <code>Party → SERVES_AS → Entity ← HOLDS_INTEREST_IN ← same Party</code>, then
+        <code>Entity → GOVERNED_BY → Jurisdiction → HAS_RULE → Axiom</code>.
+        Each hop is joined to <code>kg_visible(valid, known, principals)</code>, so time and permissions are enforced at every edge, not just the endpoints.</p>
+      <div id="qStatus" class="status"></div>
+      <div id="qTable"></div>
+      <details class="sql"><summary>Show the SQL (Cypher runs inside <code>cypher()</code>)</summary><pre id="qSql"></pre></details>
+    </div>
+  </section>
+
+  <section id="tab-graph" class="tab">
+    <div class="card">
+      <h2>Graph at the selected valid / known time</h2>
+      <p class="hint">Only edges whose assertion is valid <i>and</i> known at the selected time, and that this persona may see, are drawn. Click an edge for its evidence. A row selected in tab 1 is highlighted here.</p>
+      <div class="legend"><span class="dot party"></span>Party <span class="dot entity"></span>Entity <span class="dot jur"></span>Jurisdiction <span class="dot axiom"></span>Rule (axiom)</div>
+      <div id="net"></div>
+    </div>
+  </section>
+
+  <section id="tab-time" class="tab">
+    <div class="card">
+      <h2>Bitemporal rectangles per entity</h2>
+      <p class="hint">Each rectangle is one assertion: horizontal = valid time (when true), vertical = system time (when we knew it; up = later). Hatched = superseded by a correction. <b>Click empty space on the plot to time-travel</b> to that point; click a rectangle for its evidence.</p>
+      <div class="row"><label>Entity <select id="entitySel"></select></label>
+        <span id="chips"></span><span id="tlStatus" class="status"></span></div>
+      <div id="plot"></div>
+      <div id="tlTable"></div>
+    </div>
+  </section>
+
+  <section id="tab-diff" class="tab">
+    <div class="card">
+      <h2>Audit: what did we conclude then vs what we know now?</h2>
+      <p class="hint">Same valid-time date (left slider), two different "known as of" dates. Answers "was the decision defensible given what we knew, and what changed since?"</p>
+      <div class="row">
+        <label>Known then <input type="date" id="knownA" value="2025-10-15"></label>
+        <label>Known now <input type="date" id="knownB"></label>
+        <label class="chk"><input type="checkbox" id="knownBNow" checked> use "now"</label>
+        <button id="runDiff">Compare</button><span id="dStatus" class="status"></span>
+      </div>
+      <div id="dTable"></div>
+    </div>
+  </section>
+
+  <section id="tab-review" class="tab">
+    <div class="card">
+      <h2>Entity-resolution review queue</h2>
+      <p class="hint">Low-confidence or ambiguous resolutions are written as <b>provisional</b> edges and queued. Confirming a different candidate is a <b>bitemporal correction</b>: valid time stays the same, system time records when we fixed it, and the old assertion stays queryable "as known then".</p>
+      <div id="rTable"></div>
+    </div>
+  </section>
+</main>
+
+<aside id="drawer" class="hidden">
+  <button id="drawerClose" class="ghost">×</button>
+  <div id="drawerBody"></div>
+</aside>
+
+<footer>Demo environment: public network access + firewall allow-list is a deliberate shortcut; a production design would use private endpoints only. Small Burstable SKU — not a performance claim. Rule texts and citations are synthetic.</footer>
+<div id="toast"></div>
+<script src="vendor/vis-network.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
