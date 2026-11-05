@@ -8,36 +8,53 @@ from __future__ import annotations
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from psycopg.rows import dict_row
+import psycopg
+from psycopg.rows import dict_row, tuple_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel
 
 from kgdb import GRAPH, configure, conninfo
+from queries import PRESETS, TRIGGER_AFTER, TRIGGER_STEPS
 from seed import seed
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-PERSONAS = {
+DEFAULT_PERSONAS = {
     "priya": {"label": "Priya — Texas/Florida analyst", "principals": ["grp:all", "grp:tx", "grp:fl", "user:priya"], "can_correct": True},
     "marcus": {"label": "Marcus — California analyst", "principals": ["grp:all", "grp:ca"], "can_correct": True},
     "dana": {"label": "Dana — Auditor (read-only, all entities)", "principals": ["grp:all", "role:auditor"], "can_correct": False},
 }
+PERSONAS: dict[str, dict] = dict(DEFAULT_PERSONAS)   # replaced by the kg_user table once it exists: one source of truth, readable in SQL
 
 pool = ConnectionPool(conninfo(), min_size=1, max_size=6, open=False, configure=configure,
                       kwargs={"autocommit": True, "row_factory": dict_row})
 app = FastAPI(title="Entity governance KG - bitemporal demo")
 
 
+def load_personas() -> None:
+    try:
+        with pool.connection() as conn:
+            rows = conn.execute("SELECT user_key, display_name, principals, can_correct FROM kg_user ORDER BY sort_order").fetchall()
+    except psycopg.Error:
+        logger.warning("kg_user not found; using built-in personas")
+        return
+    if rows:
+        PERSONAS.clear()
+        PERSONAS.update({r["user_key"]: {"label": r["display_name"], "principals": list(r["principals"]), "can_correct": r["can_correct"]} for r in rows})
+
+
 @app.on_event("startup")
 def _open() -> None:
     pool.open(wait=True, timeout=60)
+    load_personas()
 
 
 @app.on_event("shutdown")
@@ -53,8 +70,10 @@ def persona_of(name: str) -> dict:
 
 
 def parse_ts(s: str | None) -> datetime:
+    """'now' means the DATABASE's clock: sys_period is stamped by the server, so a skewed app clock would hide fresh changes."""
     if not s or s == "now":
-        return datetime.now(timezone.utc)
+        with pool.connection() as conn:
+            return conn.execute("SELECT now() AS n").fetchone()["n"]
     dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
@@ -169,21 +188,34 @@ def diff(persona: str = "priya", valid: str = "2025-10-15", known_a: str = "2025
     key = lambda r: (r["entity_key"], r["party_name"])
     ka, kb = {key(r): r for r in a}, {key(r): r for r in b}
     out = []
+    gone_ids = [i for k, r in ka.items() if k not in kb for i in (r["a_director"], r["a_owner"])]
+    log: dict[int, dict] = {}
+    if gone_ids:
+        with pool.connection() as conn:
+            for row in conn.execute("SELECT DISTINCT ON (assertion_id) assertion_id, action, actor, valid_to, logged_at FROM kg_change_log "
+                                    "WHERE assertion_id = ANY(%s) ORDER BY assertion_id, log_id DESC", (gone_ids,)).fetchall():
+                log[row["assertion_id"]] = row
     for k in sorted(set(ka) | set(kb)):
         ra, rb = ka.get(k), kb.get(k)
         sa = ra["status"] if ra else "ABSENT"
         sb = rb["status"] if rb else "ABSENT"
         out.append({"entity_key": k[0], "entity_name": (rb or ra)["entity_name"], "jurisdiction": (rb or ra)["jurisdiction"],
                     "party": k[1], "then": sa, "now": sb, "changed": sa != sb,
-                    "reason": diff_reason(ra, rb)})
+                    "reason": diff_reason(ra, rb, log)})
     return {"rows": out, "ms": round(ms_a + ms_b, 1), "valid": v.isoformat(),
             "known_a": parse_ts(known_a).isoformat(), "known_b": parse_ts(known_b).isoformat()}
 
 
-def diff_reason(a, b) -> str:
+def diff_reason(a, b, log: dict | None = None) -> str:
     if a and b and a["status"] != b["status"] and b["status"] == "VIOLATION":
         return f"Rule {b['cite']} was in force from {b['rule_valid_from'][:10]} but only recorded on {b['rule_recorded'][:10]} — a late-arriving fact."
     if a and not b:
+        entry = next((log[i] for i in (a["a_director"], a["a_owner"]) if log and i in log), None)
+        if entry and entry["action"] == "amended":
+            return (f"The period was ended as of {entry['valid_to'].date()} (a real-world change), recorded "
+                    f"{entry['logged_at'].date()} by {entry['actor']}.")
+        if entry and entry["action"] == "withdrawn":
+            return f"Assertion since withdrawn by {entry['actor']} on {entry['logged_at'].date()} (recorded as a mistake, no replacement)."
         return "Assertion since corrected or superseded (the earlier knowledge was wrong)."
     if b and not a:
         return "Assertion learned after the earlier 'known as of' date."
@@ -241,6 +273,7 @@ def timeline(entity_key: str, persona: str = "priya"):
             )
             SELECT a.assertion_id, a.label, e.src, e.dst, a.props, a.doc_id, d.title AS doc_title, a.page, a.excerpt,
                    a.confidence, a.manifest_id, a.is_current,
+                   (SELECT cl.action FROM kg_change_log cl WHERE cl.assertion_id = a.assertion_id ORDER BY cl.log_id DESC LIMIT 1) AS change,
                    lower(a.valid) AS v_from, upper(a.valid) AS v_to, lower(a.sys_period) AS s_from, upper(a.sys_period) AS s_to
             FROM edges e JOIN kg_assertion_all a ON a.element_id = e.eid JOIN kg_doc d ON d.doc_id = a.doc_id
             WHERE d.acl && %s::text[]
@@ -252,6 +285,8 @@ def timeline(entity_key: str, persona: str = "priya"):
         out.append({**{k: r[k] for k in ("assertion_id", "label", "src", "dst", "doc_id", "doc_title", "page", "excerpt", "manifest_id")},
                     "role": (r["props"] or {}).get("role"), "surface": (r["props"] or {}).get("surface"),
                     "corrected_by": (r["props"] or {}).get("corrected_by"),
+                    "amended_by": (r["props"] or {}).get("amended_by"),
+                    "change": r["change"],
                     "confidence": float(r["confidence"]),
                     "status": "current" if r["is_current"] else "superseded",
                     "v_from": r["v_from"].isoformat(), "v_to": r["v_to"].isoformat() if r["v_to"] else None,
@@ -322,12 +357,213 @@ def resolve(decision_id: int, body: Resolve):
         conn.execute("UPDATE er_decision SET status='corrected', resolved_key=%s, assertion_id=%s, prior_assertion_id=%s, "
                      "decided_by=%s, decided_at=now() WHERE decision_id=%s",
                      (pkey, new["assertion_id"], old["assertion_id"], body.persona, decision_id))
+        conn.execute("INSERT INTO kg_change_log (assertion_id, new_assertion_id, action, actor, note) VALUES (%s,%s,'corrected',%s,%s)",
+                     (old["assertion_id"], new["assertion_id"], body.persona, "entity-resolution review"))
     return {"ok": True, "old_assertion": old["assertion_id"], "new_assertion": new["assertion_id"]}
+
+
+# ---------------------------------------------------------------- live amendment and retraction
+EDITABLE_LABELS = ("SERVES_AS", "HOLDS_INTEREST_IN")
+
+
+class Amend(BaseModel):
+    persona: str
+    valid_to: str
+    note: str | None = None
+
+
+class Withdraw(BaseModel):
+    persona: str
+    note: str | None = None
+
+
+def _editable_assertion(conn, assertion_id: int, p: dict) -> dict:
+    row = conn.execute("SELECT a.*, d.acl FROM kg_assertion a JOIN kg_doc d ON d.doc_id = a.doc_id "
+                       "WHERE a.assertion_id = %s FOR UPDATE OF a", (assertion_id,)).fetchone()
+    if not row or not set(row["acl"]) & set(p["principals"]):
+        raise HTTPException(404, "not found")
+    if row["label"] not in EDITABLE_LABELS:
+        raise HTTPException(400, "only role and ownership assertions can be changed here")
+    return row
+
+
+@app.post("/api/assertions/{assertion_id}/end")
+def end_period(assertion_id: int, body: Amend):
+    """Amendment: the fact stopped being true on valid_to. Valid time moves; system time records when we learned it."""
+    p = persona_of(body.persona)
+    if not p["can_correct"]:
+        raise HTTPException(403, "this persona is read-only")
+    try:
+        end = parse_ts(body.valid_to)
+    except ValueError:
+        raise HTTPException(400, "valid_to must be a date like 2026-06-30")
+    with pool.connection() as conn, conn.transaction():
+        row = _editable_assertion(conn, assertion_id, p)
+        if row["valid"].upper is not None:
+            raise HTTPException(409, "this period is already closed")
+        if end <= row["valid"].lower:
+            raise HTTPException(400, "the end date must be after the period start")
+        # UPDATE -> temporal_tables archives the previous version (open-ended period) into history
+        conn.execute("UPDATE kg_assertion SET valid = tstzrange(lower(valid), %s), "
+                     "props = props || jsonb_build_object('amended_by', %s::text) WHERE assertion_id = %s",
+                     (end, body.persona, assertion_id))
+        conn.execute("INSERT INTO kg_change_log (assertion_id, action, actor, note, valid_to) VALUES (%s,'amended',%s,%s,%s)",
+                     (assertion_id, body.persona, body.note, end))
+    return {"ok": True, "assertion": assertion_id, "valid_to": end.date().isoformat()}
+
+
+@app.post("/api/assertions/{assertion_id}/withdraw")
+def withdraw(assertion_id: int, body: Withdraw):
+    """Retraction: the assertion was a mistake and has no replacement. It is archived, never destroyed."""
+    p = persona_of(body.persona)
+    if not p["can_correct"]:
+        raise HTTPException(403, "this persona is read-only")
+    with pool.connection() as conn, conn.transaction():
+        _editable_assertion(conn, assertion_id, p)
+        conn.execute("DELETE FROM kg_assertion WHERE assertion_id = %s", (assertion_id,))
+        conn.execute("INSERT INTO kg_change_log (assertion_id, action, actor, note) VALUES (%s,'withdrawn',%s,%s)",
+                     (assertion_id, body.persona, body.note))
+    return {"ok": True, "assertion": assertion_id}
+
+
+# ---------------------------------------------------------------- variable-depth paths
+# AGE 1.7 cannot prune a variable-length traversal with a per-hop predicate, so the traversal returns each
+# path's edge ids and any path with a hop that kg_visible() does not return is discarded afterwards.
+PATH_ENDS = ("Entity", "Jurisdiction", "Axiom")
+PATHS_SQL = """
+WITH paths AS (
+  SELECT ids::text::jsonb AS edge_ids, nodes::text::jsonb AS node_ids, rels::text::jsonb AS rel_types
+  FROM cypher('entity_graph', $$
+         MATCH path=(a:Party)-[*{lo}..{hi}]->(b:{end})
+         RETURN [x IN relationships(path) | id(x)], [x IN nodes(path) | id(x)], [x IN relationships(path) | type(x)] $$)
+       AS (ids agtype, nodes agtype, rels agtype)
+),
+vis AS MATERIALIZED (SELECT element_id FROM kg_visible(%(v)s::timestamptz, %(s)s::timestamptz, %(p)s::text[]))
+SELECT node_ids, rel_types
+FROM paths p
+WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(p.edge_ids) e WHERE e::bigint NOT IN (SELECT element_id FROM vis))
+ORDER BY jsonb_array_length(p.edge_ids), p.node_ids::text
+"""
+
+
+@app.get("/api/paths")
+def paths(persona: str = "priya", valid: str = "now", known: str = "now", end: str = "Axiom", min_hops: int = 1, max_hops: int = 3):
+    p = persona_of(persona)
+    if end not in PATH_ENDS or not (1 <= min_hops <= max_hops <= 3):
+        raise HTTPException(400, "end must be Entity, Jurisdiction or Axiom; hops between 1 and 3")
+    v, s = parse_ts(valid), parse_ts(known)
+    sql = PATHS_SQL.replace("{lo}", str(min_hops)).replace("{hi}", str(max_hops)).replace("{end}", end)
+    with pool.connection() as conn:
+        t0 = time.perf_counter()
+        rows = conn.execute(sql, {"v": v, "s": s, "p": p["principals"]}).fetchall()
+        ms = (time.perf_counter() - t0) * 1000
+        names = {int(r["id"]): r["name"] for r in conn.execute(
+            "SELECT (i::text)::bigint AS id, agstr(n) AS name FROM cypher('entity_graph', $$ MATCH (n) RETURN id(n), n.name $$) AS (i agtype, n agtype)").fetchall()}
+    out = [{"hops": len(r["rel_types"]), "nodes": [names.get(int(n), str(n)) for n in r["node_ids"]], "rels": r["rel_types"]} for r in rows[:300]]
+    return {"paths": out, "shown": len(out), "more": len(rows) > 300, "ms": round(ms, 1), "valid": v.isoformat(), "known": s.isoformat(), "sql": sql.strip()}
 
 
 @app.post("/api/reset")
 def reset():
-    return seed(log=lambda *_: None)
+    stats = seed(log=lambda *_: None)
+    load_personas()
+    return stats
+
+
+# ---------------------------------------------------------------- SQL workbench (read-only)
+# Runs the reader's own SQL against the demo database so they can see the answers come straight out of PostgreSQL.
+# Guards: one statement, SELECT-like only, READ ONLY transaction (any write fails inside PostgreSQL itself),
+# 10 s timeout, 200-row cap. It runs as the database owner and therefore bypasses the persona filter; to apply a
+# user's view, call kg_visible(valid_at, known_at, principals) exactly as the app does.
+SQL_MAX_ROWS = 200
+SQL_ALLOWED = re.compile(r"^\s*(select|with|explain|show|table|values)\b", re.IGNORECASE)
+
+
+class SqlRequest(BaseModel):
+    sql: str
+
+
+def _cell(v):
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    if isinstance(v, Decimal):
+        return float(v)
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    if hasattr(v, "lower") and hasattr(v, "upper") and hasattr(v, "bounds"):
+        lo = v.lower.isoformat() if v.lower is not None else ""
+        up = v.upper.isoformat() if v.upper is not None else ""
+        return f"{v.bounds[0]}{lo}, {up}{v.bounds[1]}"
+    if isinstance(v, (list, tuple)):
+        return [_cell(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _cell(x) for k, x in v.items()}
+    return str(v)
+
+
+@app.get("/api/sql/presets")
+def sql_presets():
+    return {"presets": PRESETS}
+
+
+def _without_comments(sql: str) -> str:
+    return re.sub(r"--[^\n]*", "", re.sub(r"/\*.*?\*/", "", sql, flags=re.S))
+
+
+@app.post("/api/sql/trigger-demo")
+def trigger_demo():
+    """The one deliberate write in the workbench: a fixed UPDATE inside a transaction that is ALWAYS rolled back,
+    so the audience can watch the temporal_tables trigger archive the old version without the data changing."""
+    out = []
+
+    def run(step, conn):
+        cur = conn.cursor(row_factory=tuple_row)
+        cur.execute(step["sql"])
+        if cur.description:
+            return {"label": step["label"], "sql": step["sql"], "columns": [c.name for c in cur.description],
+                    "rows": [[_cell(v) for v in r] for r in cur.fetchall()], "note": None}
+        return {"label": step["label"], "sql": step["sql"], "columns": [], "rows": [], "note": f"{cur.rowcount} row(s) updated"}
+
+    with pool.connection() as conn:
+        with conn.transaction():
+            conn.execute("SET LOCAL statement_timeout = '10s'")
+            for s in TRIGGER_STEPS:
+                out.append(run(s, conn))
+            raise psycopg.Rollback()
+        # (Rollback is swallowed by the context manager; execution continues here, outside the transaction.)
+    with pool.connection() as conn:
+        out.append(run(TRIGGER_AFTER, conn))
+    return {"steps": out}
+
+
+@app.post("/api/sql")
+def run_sql(body: SqlRequest):
+    sql = body.sql.strip().rstrip(";").strip()
+    checked = _without_comments(sql).strip().rstrip(";").strip()
+    if not checked:
+        raise HTTPException(400, "Type a query first.")
+    if ";" in checked:
+        raise HTTPException(400, "One statement at a time, please.")
+    if not SQL_ALLOWED.match(checked):
+        raise HTTPException(400, "This workbench is read-only: start with SELECT, WITH, EXPLAIN or SHOW.")
+    t0 = time.perf_counter()
+    try:
+        with pool.connection() as conn:
+            with conn.transaction():
+                conn.execute("SET TRANSACTION READ ONLY")
+                conn.execute("SET LOCAL statement_timeout = '10s'")
+                cur = conn.cursor(row_factory=tuple_row)
+                cur.execute(sql)
+                columns = [c.name for c in cur.description] if cur.description else []
+                rows = cur.fetchmany(SQL_MAX_ROWS + 1) if cur.description else []
+    except psycopg.Error as e:
+        msg = e.diag.message_primary or str(e)
+        if e.diag.message_hint:
+            msg += f"  (hint: {e.diag.message_hint})"
+        raise HTTPException(400, msg)
+    ms = (time.perf_counter() - t0) * 1000
+    return {"columns": columns, "rows": [[_cell(v) for v in r] for r in rows[:SQL_MAX_ROWS]],
+            "truncated": len(rows) > SQL_MAX_ROWS, "ms": round(ms, 1)}
 
 
 app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")

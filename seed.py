@@ -62,6 +62,17 @@ AXIOMS = [
 ]
 
 ALL_ACL = ["grp:all"]
+USERS = [
+    ("priya", "Priya — Texas/Florida analyst",
+     "Analyst. Reads Texas and Florida documents (grp:tx, grp:fl) plus Wingtip, shared to her by name (user:priya). May correct, end a period or withdraw a fact.",
+     ["grp:all", "grp:tx", "grp:fl", "user:priya"], True, 1),
+    ("marcus", "Marcus — California analyst",
+     "Analyst. Reads California documents only (grp:ca). Cannot read Wingtip, which is shared to one named user. May correct, end a period or withdraw a fact.",
+     ["grp:all", "grp:ca"], True, 2),
+    ("dana", "Dana — Auditor (read-only, all entities)",
+     "Auditor. Reads every entity through the auditor role (role:auditor). Read-only: cannot change anything.",
+     ["grp:all", "role:auditor"], False, 3),
+]
 DOCS = [
     ("CTSL-2016", "Contoso Logistics — Operating Agreement (2016)", "agreement", "E1", ["grp:tx", "role:auditor"], "2024-02-12"),
     ("CTSL-AM1", "Contoso Logistics — First Amendment (2021)", "amendment", "E1", ["grp:tx", "role:auditor"], "2024-02-12"),
@@ -212,6 +223,9 @@ def seed(log=print) -> dict:
             conn.execute("SELECT create_vlabel(%s, %s)", (GRAPH, vl))
         for el in ("SERVES_AS", "HOLDS_INTEREST_IN", "GOVERNED_BY", "HAS_RULE"):
             conn.execute("SELECT create_elabel(%s, %s)", (GRAPH, el))
+
+        for u in USERS:
+            conn.execute("INSERT INTO kg_user VALUES (%s,%s,%s,%s,%s,%s)", u)
 
         for doc_id, title, typ, entity, acl, ing in DOCS:
             conn.execute("INSERT INTO kg_doc VALUES (%s,%s,%s,%s,%s,%s)", (doc_id, title, typ, entity, acl, d(ing)))

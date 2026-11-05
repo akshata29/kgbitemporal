@@ -37,7 +37,11 @@ def main(n: int) -> None:
         c.execute("SELECT create_vlabel(%s,%s)", (GRAPH, vl))
     for el in ("SERVES_AS", "HOLDS_INTEREST_IN", "GOVERNED_BY", "HAS_RULE"):
         c.execute("SELECT create_elabel(%s,%s)", (GRAPH, el))
-    c.execute("INSERT INTO kg_doc VALUES ('BULK','Bulk synthetic corpus','agreement',NULL,ARRAY['grp:all'],'2024-01-01')")
+    # 10 access groups: every entity's edges live in one document whose ACL is a single group, so a user holding
+    # 2 groups can see about 20% of entities. Shared rule edges use a document everyone can read.
+    for i in range(10):
+        c.execute("INSERT INTO kg_doc VALUES (%s,%s,'agreement',NULL,%s,'2024-01-01')", (f"BULK{i}", f"Bulk corpus group {i}", [f"grp:g{i}"]))
+    c.execute("INSERT INTO kg_doc VALUES ('BULKR','Shared rules','rule',NULL,ARRAY['grp:all'],'2024-01-01')")
 
     t0 = time.perf_counter()
     for j, name in (("J_TX", "Texas"), ("J_CA", "California"), ("J_FL", "Florida")):
@@ -65,10 +69,11 @@ def main(n: int) -> None:
 
     t0 = time.perf_counter()
     c.execute("SELECT set_system_time('2024-01-01')")
-    for lbl in ("SERVES_AS", "HOLDS_INTEREST_IN", "GOVERNED_BY", "HAS_RULE"):
+    for lbl, doc_expr in (("SERVES_AS", "'BULK' || (end_id::text::bigint % 10)"), ("HOLDS_INTEREST_IN", "'BULK' || (end_id::text::bigint % 10)"),
+                          ("GOVERNED_BY", "'BULK' || (start_id::text::bigint % 10)"), ("HAS_RULE", "'BULKR'")):
         props = "jsonb_build_object('role','director','surface','x')" if lbl == "SERVES_AS" else "'{}'::jsonb"
         c.execute(f"""INSERT INTO kg_assertion (element_id,label,props,doc_id,page,excerpt,confidence,manifest_id,valid)
-                      SELECT id::text::bigint, '{lbl}', {props}, 'BULK', 1, 'bulk', 0.95, 'bulk', tstzrange('2020-01-01', NULL)
+                      SELECT id::text::bigint, '{lbl}', {props}, {doc_expr}, 1, 'bulk', 0.95, 'bulk', tstzrange('2020-01-01', NULL)
                       FROM "{GRAPH}"."{lbl}" """)
     c.execute("SELECT set_system_time(NULL)")
     c.execute("""INSERT INTO kg_assertion_history
@@ -81,15 +86,46 @@ def main(n: int) -> None:
 
     sql = flagship_sql(True)
     now = datetime.now(timezone.utc)
-    params = {"v": now, "s": now, "p": ["grp:all"]}
+    everyone = ["grp:all"] + [f"grp:g{i}" for i in range(10)]
+    print("\nmain corpus-wide query (fixed depth)")
     times = []
-    for _ in range(4):
+    for _ in range(3):
         t0 = time.perf_counter()
-        rows = c.execute(sql, params).fetchall()
-        times.append((time.perf_counter() - t0) * 1000)
-    print(f"corpus-wide query (cold→warm) ms: {[round(x) for x in times]}  rows returned: {len(rows):,}")
+        rows = c.execute(sql, {"v": now, "s": now, "p": everyone}).fetchall()
+        times.append(round((time.perf_counter() - t0) * 1000))
+    print(f"  {'all 10 groups (no access filtering)':<40} ms {times}  rows {len(rows):,}")
+    # Conflicts are not spread evenly over groups in this generator, so pick the two groups that hold the most of them.
+    from collections import Counter
+    top2 = [d.removeprefix("BULK") for d, _ in Counter(r["director_doc"] for r in rows).most_common(2)]
+    two_groups = ["grp:all"] + [f"grp:g{g}" for g in top2]
+    times = []
+    for _ in range(3):
+        t0 = time.perf_counter()
+        sel = c.execute(sql, {"v": now, "s": now, "p": two_groups}).fetchall()
+        times.append(round((time.perf_counter() - t0) * 1000))
+    print(f"  {'2 of 10 groups (selective ACL)':<40} ms {times}  rows {len(sel):,}")
     edges = c.execute(f'SELECT (SELECT count(*) FROM "{GRAPH}"."SERVES_AS") s, (SELECT count(*) FROM "{GRAPH}"."HOLDS_INTEREST_IN") b').fetchone()
-    print(f"edges: SERVES_AS {edges['s']:,}  HOLDS_INTEREST_IN {edges['b']:,}")
+    print(f"  edges: SERVES_AS {edges['s']:,}  HOLDS_INTEREST_IN {edges['b']:,}")
+
+    vl = """
+    WITH paths AS (
+      SELECT ids::text::jsonb AS ids
+      FROM cypher('entity_graph', $$ MATCH path=(a:Party)-[*{lo}..{hi}]->(b:{end}) RETURN [x IN relationships(path) | id(x)] $$) AS (ids agtype)
+    ),
+    vis AS MATERIALIZED (SELECT element_id FROM kg_visible(%(v)s, %(s)s, %(p)s::text[]))
+    SELECT count(*) AS n FROM paths p
+    WHERE NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(p.ids) e WHERE e::bigint NOT IN (SELECT element_id FROM vis))
+    """
+    print("variable-length traversal, per-hop visibility applied after traversal")
+    for tag, lo, hi, end in (("2-hop to Jurisdiction", 1, 2, "Jurisdiction"), ("3-hop to rule", 3, 3, "Axiom")):
+        for label, principals in (("all 10 groups", everyone), ("2 of 10 groups", two_groups)):
+            q = vl.replace("{lo}", str(lo)).replace("{hi}", str(hi)).replace("{end}", end)
+            times = []
+            for _ in range(2):
+                t0 = time.perf_counter()
+                n = c.execute(q, {"v": now, "s": now, "p": principals}).fetchone()["n"]
+                times.append(round((time.perf_counter() - t0) * 1000))
+            print(f"  {tag:<24} {label:<16} ms {times}  visible paths {n:,}")
 
 
 if __name__ == "__main__":

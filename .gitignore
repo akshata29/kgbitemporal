@@ -1,0 +1,24 @@
+# Secrets and connection settings (deploy.ps1 generates .env locally)
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+
+# Personal / presenter-only helpers
+azlogin.ps1
+package.ps1
+Demo-Technical-QA.md
+kg-bitemporal-demo.zip
+
+# Source architecture material (not part of the demo repo)
+diagrams/
+previews/
+
+# Python / local runtime
+__pycache__/
+*.pyc
+.venv/
+uv.out
+uv.err
+uv.pid

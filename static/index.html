@@ -36,6 +36,7 @@
     <button data-preset="decision">Audit: decision of 2025-10-15, as known then</button>
     <button data-preset="fabrikam-early">Fabrikam: 2024-09-01, known 2024-09-10</button>
     <button data-preset="fabrikam-late">Fabrikam: 2024-09-01, known 2024-10-01</button>
+    <button data-preset="day-one">Day-one corpus: today, known 2024-02-15</button>
   </div>
   <div class="ctl">
     <div class="ctl-h"><b>Entity resolution</b> <i>"is 'Hank' the same person as 'Henrik'?"</i></div>
@@ -50,6 +51,8 @@
   <button data-tab="time">3 · Bitemporal view</button>
   <button data-tab="diff">4 · Then vs now (audit)</button>
   <button data-tab="review">5 · Review &amp; correct</button>
+  <button data-tab="paths">6 · Variable-depth paths</button>
+  <button data-tab="sql">7 · SQL workbench</button>
 </nav>
 
 <main>
@@ -60,6 +63,7 @@
         <code>Party → SERVES_AS → Entity ← HOLDS_INTEREST_IN ← same Party</code>, then
         <code>Entity → GOVERNED_BY → Jurisdiction → HAS_RULE → Axiom</code>.
         Each hop is joined to <code>kg_visible(valid, known, principals)</code>, so time and permissions are enforced at every edge, not just the endpoints.</p>
+      <p class="hint"><b>How to read a row:</b> at this entity, <i>Person</i> is a director <i>and</i> an owner (the two names as written in the two documents are in <i>As extracted</i>, with the pages in <i>Evidence</i>). <b>Requires independent director</b> means a rule in force for that jurisdiction applies to this pattern, so the entity is flagged for review; it does not check whether an independent director already exists. <b>Pattern only</b> means the same person is director and owner but no rule is known in force.</p>
       <div id="qStatus" class="status"></div>
       <div id="qTable"></div>
       <details class="sql"><summary>Show the SQL (Cypher runs inside <code>cypher()</code>)</summary><pre id="qSql"></pre></details>
@@ -78,7 +82,7 @@
   <section id="tab-time" class="tab">
     <div class="card">
       <h2>Bitemporal rectangles per entity</h2>
-      <p class="hint">Each rectangle is one assertion: horizontal = valid time (when true), vertical = system time (when we knew it; up = later). Hatched = superseded by a correction. <b>Click empty space on the plot to time-travel</b> to that point; click a rectangle for its evidence.</p>
+      <p class="hint">Each rectangle is one assertion: horizontal = valid time (when true), vertical = system time (when we knew it; up = later). Hatched = superseded by a correction, amendment or withdrawal. <b>Click empty space on the plot to time-travel</b> to that point; click a rectangle for its evidence.</p>
       <div class="row"><label>Entity <select id="entitySel"></select></label>
         <span id="chips"></span><span id="tlStatus" class="status"></span></div>
       <div id="plot"></div>
@@ -105,6 +109,35 @@
       <h2>Entity-resolution review queue</h2>
       <p class="hint">Low-confidence or ambiguous resolutions are written as <b>provisional</b> edges and queued. Confirming a different candidate is a <b>bitemporal correction</b>: valid time stays the same, system time records when we fixed it, and the old assertion stays queryable "as known then".</p>
       <div id="rTable"></div>
+    </div>
+  </section>
+  <section id="tab-paths" class="tab">
+    <div class="card">
+      <h2>Variable-depth paths, with time and access checked on every hop</h2>
+      <p class="hint">Starts at any person and follows <i>any</i> edges for 1 to 3 hops to an entity, jurisdiction or rule. AGE can't prune a variable-length traversal by a per-hop predicate, so each path's edge ids are returned and a path is kept only if <b>every</b> hop passes <code>kg_visible(valid, known, principals)</code>. Move the sliders or switch user and the set of paths changes. Cost follows the number of paths AGE produces, not the number that survive.</p>
+      <div class="row">
+        <label>Ends at <select id="pathEnd"><option>Axiom</option><option>Jurisdiction</option><option>Entity</option></select></label>
+        <label>Minimum hops <select id="pathMin"><option>1</option><option>2</option><option selected>3</option></select></label>
+        <label>Maximum hops <select id="pathMax"><option>1</option><option>2</option><option selected>3</option></select></label>
+        <span id="pStatus" class="status"></span>
+      </div>
+      <div id="pTable"></div>
+      <details class="sql"><summary>Show the SQL</summary><pre id="pSql"></pre></details>
+    </div>
+  </section>
+  <section id="tab-sql" class="tab">
+    <div class="card">
+      <h2>The same answers, straight from PostgreSQL</h2>
+      <p class="hint">Every screen in this demo is a query against a real PostgreSQL database holding synthetic data. Pick a query on the left (grouped by walkthrough step), read it, edit it and run it. It is <b>read-only</b>: PostgreSQL itself rejects any write. It runs as the database owner, so it sees everything; to apply one user's view, call <code>kg_visible(valid_at, known_at, principals)</code> exactly as the app does.</p>
+      <div class="sqlwrap">
+        <div id="sqlList"></div>
+        <div class="sqlmain">
+          <div id="sqlInfo" class="sqlinfo"></div>
+          <textarea id="sqlText" spellcheck="false" rows="14"></textarea>
+          <div class="row"><button id="sqlRun">Run  (Ctrl+Enter)</button><span id="sqlStatus" class="status"></span></div>
+          <div id="sqlOut"></div>
+        </div>
+      </div>
     </div>
   </section>
 </main>

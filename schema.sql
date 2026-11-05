@@ -8,10 +8,19 @@
 
 DROP VIEW IF EXISTS kg_assertion_all;
 DROP FUNCTION IF EXISTS kg_visible(timestamptz, timestamptz, text[]);
-DROP TABLE IF EXISTS er_decision, kg_assertion, kg_assertion_history, kg_doc, party_registry CASCADE;
+DROP TABLE IF EXISTS kg_user, kg_change_log, er_decision, kg_assertion, kg_assertion_history, kg_doc, party_registry CASCADE;
 
 CREATE OR REPLACE FUNCTION agstr(a agtype) RETURNS text
 LANGUAGE sql IMMUTABLE AS $fn$ SELECT trim(both '"' from a::text) $fn$;
+
+CREATE TABLE kg_user (
+    user_key         text PRIMARY KEY,
+    display_name     text NOT NULL,
+    role_description text NOT NULL,
+    principals       text[] NOT NULL,   -- what the user holds: groups, named grants, roles. Matched against kg_doc.acl
+    can_correct      boolean NOT NULL,
+    sort_order       int NOT NULL
+);
 
 CREATE TABLE kg_doc (
     doc_id       text PRIMARY KEY,
@@ -89,3 +98,17 @@ CREATE TABLE er_decision (
     decided_by         text,
     decided_at         timestamptz
 );
+
+-- Append-only record of who changed which assertion and how. The assertion tables hold WHAT changed
+-- (via history); this log holds WHY and BY WHOM, and lets the audit diff explain each difference.
+CREATE TABLE kg_change_log (
+    log_id           bigserial PRIMARY KEY,
+    assertion_id     bigint NOT NULL,
+    new_assertion_id bigint,
+    action           text NOT NULL CHECK (action IN ('corrected', 'amended', 'withdrawn')),
+    actor            text NOT NULL,
+    note             text,
+    valid_to         timestamptz,
+    logged_at        timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX kg_change_log_assertion ON kg_change_log (assertion_id);

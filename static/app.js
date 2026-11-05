@@ -15,6 +15,7 @@ async function api(path, params = {}, opts = {}) {
   if (!r.ok) throw new Error(path + " → " + r.status + " " + (await r.text()).slice(0, 200));
   return r.json();
 }
+const post = (body) => ({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 function toast(msg) { const t = $("#toast"); t.textContent = msg; t.style.display = "block"; setTimeout(() => (t.style.display = "none"), 3500); }
 
 // ---- time params: slider at its maximum means "now" so later corrections show up
@@ -149,10 +150,46 @@ function drawPlot() {
     const vd = Math.round(x0 + ((p.x - m.l) / (W - m.l - m.r)) * (x1 - x0)), kd = Math.round(y0 + ((H - m.b - p.y) / (H - m.t - m.b)) * (y1 - y0));
     setTimes(vd, kd);
   };
-  $("#tlTable").innerHTML = `<table><thead><tr><th>Status</th><th>Assertion</th><th>Valid</th><th>Known</th><th>Evidence</th></tr></thead><tbody>` + rows.map((a) =>
-    `<tr><td>${a.status === "current" ? '<span class="tag g">current</span>' : '<span class="tag n">superseded</span>'}</td><td>${esc(a.label)}${a.role ? " · " + esc(a.role) : ""}<div class="small">${esc(a.src)} → ${esc(a.dst)}</div></td>
-     <td>${fmt(a.v_from)} … ${a.v_to ? fmt(a.v_to) : "open"}</td><td>${fmt(a.s_from)} … ${a.s_to ? fmt(a.s_to) : "open"}</td><td class="small">${esc(a.doc_id)} p.${a.page} · conf ${a.confidence.toFixed(2)}${a.corrected_by ? " · corrected by " + esc(a.corrected_by) : ""}</td></tr>`).join("") + "</tbody></table>";
-}
+  $("#tlTable").innerHTML = `<table><thead><tr><th>Status</th><th>Assertion</th><th>Valid</th><th>Known</th><th>Evidence</th><th>Actions</th></tr></thead><tbody>` + rows.map((a) =>
+    `<tr><td>${a.status === "current" ? '<span class="tag g">current</span>' : `<span class="tag n">superseded${a.change ? " · " + esc(a.change) : ""}</span>`}</td><td>${esc(a.label)}${a.role ? " · " + esc(a.role) : ""}<div class="small">${esc(a.src)} → ${esc(a.dst)}</div></td>
+     <td>${fmt(a.v_from)} … ${a.v_to ? fmt(a.v_to) : "open"}</td><td>${fmt(a.s_from)} … ${a.s_to ? fmt(a.s_to) : "open"}</td><td class="small">${esc(a.doc_id)} p.${a.page} · conf ${a.confidence.toFixed(2)}     ${a.corrected_by ? " · corrected by " + esc(a.corrected_by) : ""}${a.amended_by ? " · period ended by " + esc(a.amended_by) : ""}</td>${actionsCell(a)}</tr>`).join("") + "</tbody></table>";
+       $("#tlTable").querySelectorAll("button[data-act]").forEach((b) => (b.onclick = () => changeAssertion(b)));
+     }
+
+     function actionsCell(a) {
+       const can = S.meta?.personas?.[S.persona]?.can_correct;
+       if (!can || a.status !== "current" || !["SERVES_AS", "HOLDS_INTEREST_IN"].includes(a.label)) return "<td></td>";
+       const end = a.v_to ? "" : `<input type="date" class="endDate" data-id="${a.assertion_id}" value="${isoDay(S.vMax - 120)}"> <button data-act="end" data-id="${a.assertion_id}">End period</button> `;
+       return `<td style="white-space:nowrap">${end}<button data-act="withdraw" data-id="${a.assertion_id}">Withdraw</button></td>`;
+     }
+     async function changeAssertion(b) {
+       const id = b.dataset.id; b.disabled = true;
+       try {
+         if (b.dataset.act === "end") {
+           const d = $(`#tlTable input.endDate[data-id="${id}"]`).value;
+           const r = await api(`assertions/${id}/end`, {}, post({ persona: S.persona, valid_to: d }));
+           toast(`Period ended on ${r.valid_to}. The open-ended version is archived and still visible "as known then".`);
+         } else {
+           if (!confirm("Withdraw this assertion? It is archived (never destroyed) and no replacement is created.")) { b.disabled = false; return; }
+           await api(`assertions/${id}/withdraw`, {}, post({ persona: S.persona }));
+           toast('Withdrawn. The assertion is archived and still visible "as known then".');
+         }
+         refresh();
+       } catch (e) { toast(e.message); b.disabled = false; }
+     }
+
+     // ---- 6. variable-depth paths
+     async function loadPaths() {
+       $("#pStatus").textContent = "querying…";
+       try {
+         const j = await api("paths", { persona: S.persona, valid: validParam(), known: knownParam(), end: $("#pathEnd").value, min_hops: $("#pathMin").value, max_hops: $("#pathMax").value });
+         $("#pSql").textContent = j.sql;
+         $("#pStatus").innerHTML = `Valid <b>${fmt(j.valid)}</b> · known as of <b>${fmt(j.known)}</b> · ${j.shown}${j.more ? "+" : ""} visible path(s) · <b>${j.ms} ms</b>`;
+         $("#pTable").innerHTML = j.paths.length ? `<table><thead><tr><th>Hops</th><th>Path</th></tr></thead><tbody>` + j.paths.map((p) =>
+           `<tr><td>${p.hops}</td><td>` + p.nodes.map((n, i) => `<b>${esc(n)}</b>` + (i < p.rels.length ? ` <span class="small">— ${esc(p.rels[i])} →</span> ` : "")).join("") + "</td></tr>").join("") + "</tbody></table>"
+           : "<p class='small'>No paths are visible to this user at this point in valid and known time.</p>";
+       } catch (e) { $("#pStatus").innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+     }
 
 // ---- 4. diff
 const statusTag = (s) => s === "VIOLATION" ? '<span class="tag v">VIOLATION</span>' : s === "PATTERN_ONLY" ? '<span class="tag p">pattern only</span>' : '<span class="tag n">not present</span>';
@@ -192,17 +229,72 @@ async function loadReview() {
   }));
 }
 
+// ---- 7. SQL workbench
+async function loadSql() {
+  if (S.presets) return;
+  const j = await api("sql/presets"); S.presets = j.presets;
+  const groups = [...new Set(S.presets.map((p) => p.group))];
+  $("#sqlList").innerHTML = groups.map((g) => `<h4>${esc(g)}</h4>` + S.presets.filter((p) => p.group === g)
+    .map((p) => `<button data-id="${p.id}">${esc(p.title)}</button>`).join("")).join("");
+  $("#sqlList").querySelectorAll("button").forEach((b) => (b.onclick = () => pickPreset(b.dataset.id)));
+  pickPreset("real-pg");
+}
+function pickPreset(id) {
+  const p = S.presets.find((x) => x.id === id); if (!p) return;
+  S.script = !!p.script;
+  $("#sqlList").querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.id === id));
+  $("#sqlInfo").innerHTML = `<b>${esc(p.title)}</b><span class="step">${esc(p.step)}</span><p>${esc(p.look_for).replace(/`([^`]+)`/g, "<code>$1</code>")}</p>`;
+  $("#sqlText").readOnly = S.script;
+  $("#sqlRun").textContent = S.script ? "Run the demonstration  (rolled back)" : "Run  (Ctrl+Enter)";
+  $("#sqlText").value = p.sql; runSql();
+}
+async function runScript() {
+  $("#sqlOut").classList.add("script");
+  $("#sqlStatus").textContent = "running…"; $("#sqlRun").disabled = true;
+  try {
+    const j = await api("sql/trigger-demo", {}, post({}));
+    $("#sqlStatus").innerHTML = `${j.steps.length} steps · transaction <b>rolled back</b>: no data was changed`;
+    $("#sqlOut").innerHTML = j.steps.map((s, i) => `<div class="scr"><b>${i + 1} · ${esc(s.label)}</b><pre>${esc(s.sql)}</pre>` +
+      (s.columns.length ? `<table><thead><tr>${s.columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>` +
+        (s.rows.length ? s.rows.map((r) => `<tr>${r.map(sqlCell).join("")}</tr>`).join("") : `<tr><td colspan="${s.columns.length}" class="small">No rows.</td></tr>`) + "</tbody></table>"
+        : `<p class="small">${esc(s.note)}</p>`) + "</div>").join("");
+  } catch (e) {
+    $("#sqlStatus").textContent = ""; $("#sqlOut").innerHTML = `<p class="err" style="padding:10px;margin:0">${esc(e.message)}</p>`;
+  } finally { $("#sqlRun").disabled = false; }
+}
+function sqlCell(v) {
+  if (v === null) return '<td><span class="null">NULL</span></td>';
+  if (v === true) return '<td><span class="t">true</span></td>';
+  if (v === false) return '<td><span class="f">false</span></td>';
+  const s = typeof v === "object" ? JSON.stringify(v) : String(v);
+  return `<td class="${s.includes("\n") ? "wrap" : ""}" title="${esc(s.slice(0, 400))}">${esc(s.length > 1500 ? s.slice(0, 1500) + "…" : s)}</td>`;
+}
+async function runSql() {
+  $("#sqlOut").classList.remove("script");
+  if (S.script) return runScript();
+  $("#sqlStatus").textContent = "running…"; $("#sqlRun").disabled = true;
+  try {
+    const j = await api("sql", {}, post({ sql: $("#sqlText").value }));
+    $("#sqlStatus").innerHTML = `${j.rows.length}${j.truncated ? "+" : ""} row(s) · <b>${j.ms} ms</b>${j.truncated ? " · showing the first 200" : ""}`;
+    $("#sqlOut").innerHTML = j.columns.length ? `<table><thead><tr>${j.columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>` +
+      (j.rows.length ? j.rows.map((r) => `<tr>${r.map(sqlCell).join("")}</tr>`).join("") : `<tr><td colspan="${j.columns.length}" class="small">No rows.</td></tr>`) + "</tbody></table>" : "<p class='small' style='padding:10px'>Done.</p>";
+  } catch (e) {
+    $("#sqlStatus").textContent = ""; $("#sqlOut").innerHTML = `<p class="err" style="padding:10px;margin:0">${esc(e.message.replace(/^sql → 400 /, "").replace(/^\{"detail":"|"\}$/g, ""))}</p>`;
+  } finally { $("#sqlRun").disabled = false; }
+}
+
 // ---- orchestration
 function refresh() {
   loadQuery(); loadReview();
   if ($("#tab-graph").classList.contains("on")) loadGraph();
   if ($("#tab-time").classList.contains("on")) loadTimeline();
   if ($("#tab-diff").classList.contains("on")) loadDiff();
+  if ($("#tab-paths").classList.contains("on")) loadPaths();
 }
 function showTab(name) {
   document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === name));
   document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t.id === "tab-" + name));
-  if (name === "graph") loadGraph(); if (name === "time") loadTimeline(); if (name === "diff") loadDiff(); if (name === "review") loadReview();
+  if (name === "graph") loadGraph(); if (name === "time") loadTimeline(); if (name === "diff") loadDiff(); if (name === "review") loadReview(); if (name === "paths") loadPaths(); if (name === "sql") loadSql();
 }
 async function loadMeta() {
   const m = await api("meta", { persona: S.persona }); S.meta = m;
@@ -218,6 +310,7 @@ async function loadMeta() {
 async function init() {
   const m = await api("meta", { persona: "priya" });
   $("#persona").innerHTML = Object.entries(m.personas).map(([k, v]) => `<option value="${k}">${esc(v.label)}</option>`).join("");
+  $("#persona").value = S.persona;
   $("#chips").innerHTML = ["SERVES_AS", "HOLDS_INTEREST_IN", "GOVERNED_BY", "HAS_RULE"].map((l) => `<label><input type="checkbox" data-l="${l}" ${S.chips.has(l) ? "checked" : ""}> <span class="dot" style="background:${LBL_COLOR[l]}"></span>${l}</label>`).join("");
   $("#chips").querySelectorAll("input").forEach((c) => (c.onchange = () => { c.checked ? S.chips.add(c.dataset.l) : S.chips.delete(c.dataset.l); drawPlot(); }));
   await loadMeta(); refresh();
@@ -235,7 +328,13 @@ document.querySelectorAll("[data-preset]").forEach((b) => (b.onclick = () => {
   if (p === "decision") { setTimes(dayOf("2025-10-15"), dayOf("2025-10-15")); }
   if (p === "fabrikam-early") setTimes(dayOf("2024-09-01"), dayOf("2024-09-10"));
   if (p === "fabrikam-late") setTimes(dayOf("2024-09-01"), dayOf("2024-10-01"));
+  if (p === "day-one") setTimes("today", dayOf("2024-02-15"));
 }));
+$("#pathEnd").onchange = loadPaths;
+$("#sqlRun").onclick = runSql;
+$("#sqlText").onkeydown = (e) => { if (e.ctrlKey && e.key === "Enter") { e.preventDefault(); runSql(); } };
+$("#pathMin").onchange = () => { if (+$("#pathMax").value < +$("#pathMin").value) $("#pathMax").value = $("#pathMin").value; loadPaths(); };
+$("#pathMax").onchange = () => { if (+$("#pathMin").value > +$("#pathMax").value) $("#pathMin").value = $("#pathMax").value; loadPaths(); };
 $("#reset").onclick = async () => {
   if (!confirm("Drop and re-seed the demo database? (takes ~20 s)")) return;
   toast("Re-seeding…"); await api("reset", {}, { method: "POST" }); S.hl = { nodes: new Set(), edges: new Set() }; await loadMeta(); refresh(); toast("Demo data reset.");

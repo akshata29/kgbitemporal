@@ -54,3 +54,21 @@ footer { position:fixed; bottom:0; left:0; right:0; background:#14202e; color:#9
 #toast { position:fixed; bottom:48px; left:50%; transform:translateX(-50%); background:#14202e; color:#fff; padding:10px 18px; border-radius:8px; display:none; z-index:30; }
 .cand { display:inline-flex; gap:6px; align-items:center; margin:2px 8px 2px 0; }
 .err { color:var(--red); }
+.sqlwrap { display:grid; grid-template-columns: 300px minmax(0,1fr); gap:16px; align-items:start; }
+#sqlList { border:1px solid var(--line); border-radius:8px; max-height:720px; overflow:auto; background:#fafbfc; }
+#sqlList h4 { margin:0; padding:7px 10px; font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); background:#eef2f7; position:sticky; top:0; }
+#sqlList button { display:block; width:100%; text-align:left; border:none; border-bottom:1px solid var(--line); border-radius:0; background:transparent; padding:7px 10px; font-size:12.5px; }
+#sqlList button:hover { background:#eaf3fc; } #sqlList button.on { background:#d9eafb; font-weight:600; }
+.sqlinfo { margin-bottom:8px; } .sqlinfo b { font-size:14px; } .sqlinfo .step { color:var(--blue); font-size:12px; margin-left:6px; }
+.sqlinfo p { margin:4px 0 0; color:var(--muted); font-size:13px; }
+#sqlText { width:100%; font:12.5px/1.45 Consolas, "Cascadia Mono", monospace; padding:10px; border:1px solid var(--line); border-radius:8px; background:#0f1722; color:#d7e3f1; resize:vertical; tab-size:2; }
+#sqlOut { margin-top:10px; overflow:auto; max-height:460px; border:1px solid var(--line); border-radius:8px; }
+#sqlOut table { margin:0; font-size:12.5px; } #sqlOut th { position:sticky; top:0; }
+#sqlOut td { font-family:Consolas, "Cascadia Mono", monospace; font-size:12px; white-space:nowrap; max-width:520px; overflow:hidden; text-overflow:ellipsis; }
+#sqlOut td.wrap { white-space:pre-wrap; overflow:visible; }
+#sqlOut .null { color:#9aa6b5; font-style:italic; } #sqlOut .t { color:var(--green); } #sqlOut .f { color:var(--red); }
+#sqlOut .scr { padding:10px 12px; border-bottom:1px solid var(--line); } #sqlOut .scr b { font-size:13px; }
+#sqlOut.script { max-height:none; overflow:visible; }
+#sqlOut .scr pre { margin:6px 0; padding:8px 10px; background:#0f1722; color:#d7e3f1; border-radius:6px; font-size:12px; overflow:auto; }
+#sqlOut .scr table { border:1px solid var(--line); } #sqlOut .scr p { margin:4px 0 0; }
+#sqlText[readonly] { opacity:.92; }
